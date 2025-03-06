@@ -6,8 +6,8 @@
 
 # 2. Load and Process Financial Report
 
-from PyPDF2 import PdfReader
-import re
+#from PyPDF2 import PdfReader
+#import re
 
 def extract_text_from_pdf(pdf_path):
     """Extracts text from a financial PDF and cleans it."""
