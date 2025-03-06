@@ -1,7 +1,7 @@
 # 1.Install Required Packages
 
-pip install streamlit sentence-transformers faiss-cpu rank-bm25 transformers pypdf torch spacy
-python -m spacy download en_core_web_sm
+#pip install streamlit sentence-transformers faiss-cpu rank-bm25 transformers pypdf torch spacy
+#python -m spacy download en_core_web_sm
 
 
 # 2. Load and Process Financial Report
