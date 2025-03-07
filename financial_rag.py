@@ -1,4 +1,5 @@
 # ✅ Load Financial PDF & Process Data
+from pypdf import PdfReader
 @st.cache_data
 def load_pdf(pdf_path):
     with pdfplumber.open(pdf_path) as pdf:
