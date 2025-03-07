@@ -1,8 +1,9 @@
 streamlit
-sentence-transformers
+pdfplumber
 faiss-cpu
-rank-bm25
-transformers
+numpy
+rank_bm25
+sentence-transformers
+thefuzz
 torch
-spacy
-pypdf
+transformers
