@@ -1,161 +1,159 @@
-# 1.Install Required Packages
-
-#pip install streamlit sentence-transformers faiss-cpu rank-bm25 transformers pypdf torch spacy
-#python -m spacy download en_core_web_sm
-
-
-# 2. Load and Process Financial Report
-
-#from PyPDF2 import PdfReader
-#import re
-
-def extract_text_from_pdf(pdf_path):
-    """Extracts text from a financial PDF and cleans it."""
-    reader = PdfReader(pdf_path)
-    text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
-    text = re.sub(r'\n+', '\n', text).strip()
+# ✅ Load Financial PDF & Process Data
+@st.cache_data
+def load_pdf(pdf_path):
+    with pdfplumber.open(pdf_path) as pdf:
+        text = "\n".join([page.extract_text() for page in pdf.pages if page.extract_text()])
     return text
 
-# Load BMW Finance Annual Report
-pdf_text = extract_text_from_pdf("/content/BMW_Finance_NV_Annual_Report_2023.pdf")
+@st.cache_data
+def extract_tables_from_pdf(pdf_path):
+    extracted_tables = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            tables = page.extract_tables()
+            for table in tables:
+                extracted_tables.append(table)
+    return extracted_tables
 
-# 3. Chunking & Embedding Storage
-
-from sentence_transformers import SentenceTransformer
-import faiss
-import numpy as np
-from rank_bm25 import BM25Okapi
-
-# Load Embedding Model (Best Open-Source Financial Embedding)
-embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
-# Chunking the Text
+@st.cache_data
 def chunk_text(text, chunk_size=300):
     words = text.split()
     return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size//2)]
 
+# ✅ Load Data
+pdf_path = "/content/BMW_Finance_NV_Annual_Report_2023.pdf"
+pdf_text = load_pdf(pdf_path)
+tables = extract_tables_from_pdf(pdf_path)
 text_chunks = chunk_text(pdf_text)
 
-# Compute Embeddings
+# ✅ Set Up Multi-Stage Retrieval (BM25 + FAISS)
+embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 chunk_embeddings = np.array([embedding_model.encode(chunk) for chunk in text_chunks])
 
-# Store in FAISS Vector Database
 dimension = chunk_embeddings.shape[1]
 index = faiss.IndexFlatL2(dimension)
 index.add(chunk_embeddings)
 
-# Save FAISS Index
-faiss.write_index(index, "financial_rag.index")
-
-# Initialize BM25 for Keyword Search
 tokenized_chunks = [chunk.split() for chunk in text_chunks]
 bm25 = BM25Okapi(tokenized_chunks)
 
-# 5. Multi-Stage Retrieval (BM25 + FAISS Hybrid)
-
-def multistage_retrieve_top_chunks(query, k=5, bm25_k=10, alpha=0.5):
-    """
-    Multi-Stage Retrieval:
-    1. BM25 First-Stage: Get top `bm25_k` candidates based on keyword match.
-    2. FAISS Second-Stage: Run FAISS search only on these candidates.
-    3. Re-Ranking: Combine BM25 and FAISS scores for final ranking.
-    """
+# ✅ Multi-Stage Retrieval with Confidence Score
+def multistage_retrieve(query, k=5, bm25_k=10, alpha=0.5):
+    """Retrieval + Confidence Score: Uses BM25, FAISS, and re-ranking."""
     query_embedding = embedding_model.encode([query])
 
     # 🔹 Stage 1: BM25 Keyword Search
     bm25_scores = bm25.get_scores(query.split())
-    top_bm25_indices = np.argsort(bm25_scores)[-bm25_k:]  # Select top `bm25_k` BM25 results
+    top_bm25_indices = np.argsort(bm25_scores)[-bm25_k:]
+    bm25_confidence = np.max(bm25_scores)  # Get highest BM25 score
 
-    # 🔹 Stage 2: FAISS Vector Search (only on BM25-filtered chunks)
+    # 🔹 Stage 2: FAISS Vector Search
     filtered_embeddings = np.array([chunk_embeddings[i] for i in top_bm25_indices])
     faiss_index = faiss.IndexFlatL2(filtered_embeddings.shape[1])
     faiss_index.add(filtered_embeddings)
 
     _, faiss_ranks = faiss_index.search(query_embedding, k)
-    top_faiss_indices = [top_bm25_indices[i] for i in faiss_ranks[0]]  # Map back to original indices
+    top_faiss_indices = [top_bm25_indices[i] for i in faiss_ranks[0]]
 
-    # 🔹 Stage 3: Re-Ranking (Combining BM25 & FAISS Scores)
+    # 🔹 Stage 3: Re-Ranking (BM25 + FAISS Scores)
     final_scores = {}
+    faiss_confidence = 0  # Initialize FAISS confidence
     for i in set(top_bm25_indices) | set(top_faiss_indices):
         bm25_score = bm25_scores[i] if i in top_bm25_indices else 0
         faiss_score = -np.linalg.norm(query_embedding - chunk_embeddings[i])  # L2 distance
-        final_scores[i] = alpha * bm25_score + (1 - alpha) * faiss_score  # Weighted ranking
+        final_scores[i] = alpha * bm25_score + (1 - alpha) * faiss_score
+        faiss_confidence = max(faiss_confidence, faiss_score)  # Get highest FAISS score
 
-    # Get final top K chunks
+    # Normalize confidence (scale to 0-100)
+    bm25_confidence = (bm25_confidence / max(bm25_scores)) * 100 if max(bm25_scores) > 0 else 0
+    faiss_confidence = (faiss_confidence + 1) * 50  # Scale from -1 to 1 into 0-100
+
+    # Final Confidence Score
+    final_confidence = (bm25_confidence + faiss_confidence) / 2
+
+    # Get Top K Chunks
     top_chunks = sorted(final_scores, key=final_scores.get, reverse=True)[:k]
-    
-    return [text_chunks[i] for i in top_chunks]
+    return [text_chunks[i] for i in top_chunks], round(final_confidence, 2)
 
-#5 . FinGPT Response Generation
+# ✅ Retrieve Financial Values from Tables
+def extract_financial_value(tables, query):
+    """Find financial values using fuzzy matching with table match confidence."""
+    possible_headers = []
 
-from transformers import pipeline
+    for table in tables:
+        for row in table:
+            row_text = " ".join(str(cell) for cell in row if cell)
+            possible_headers.append(row_text)
 
-# Load FinGPT or Equivalent SLM
-generator = pipeline("text-generation", model="facebook/opt-1.3b")  # Replace with "FinGPT" when available
+    # 🔹 Find Best-Matching Row for the Query
+    extraction_result = process.extractOne(query, possible_headers, score_cutoff=80)
 
-def generate_answer(query):
-    """Retrieve relevant context and generate financial answers."""
-    retrieved_context = "\n".join(hybrid_retrieve_top_chunks(query))
-    prompt = f"Context: {retrieved_context}\n\nQuestion: {query}\n\nAnswer:"
-    response = generator(prompt, max_length=100, do_sample=True)[0]["generated_text"]
-    return response
+    if extraction_result:
+        best_match, score = extraction_result
+    else:
+        return ["No valid financial data found"], 0  # No match → Confidence = 0
 
-# 6. Hallucination Detection
+    # 🔹 Extract Correct Numbers from the Matched Row
+    for table in tables:
+        for row in table:
+            row_text = " ".join(str(cell) for cell in row if cell)
+            if best_match in row_text:
+                numbers = [cell for cell in row if re.match(r"\d{1,3}(?:,\d{3})*(?:\.\d+)?", str(cell))]
+                if len(numbers) >= 2:
+                    return numbers[:2], round(score, 2)  # Return values + confidence
 
-import spacy
+    return ["No valid financial data found"], 0
 
-nlp = spacy.load("en_core_web_sm")
+# ✅ Streamlit UI
+st.set_page_config(page_title="Financial Query System", layout="wide")
 
-def extract_numbers_and_entities(text):
-    """Extracts numerical values and financial terms using NER."""
-    doc = nlp(text)
-    numbers = [ent.text for ent in doc.ents if ent.label_ in ["MONEY", "CARDINAL", "PERCENT", "QUANTITY"]]
-    return set(numbers)
-
-def detect_hallucinations(query, generated_answer, retrieved_context):
-    """Detects hallucinations by checking generated numbers/entities against retrieved text."""
-    extracted_from_answer = extract_numbers_and_entities(generated_answer)
-    extracted_from_context = extract_numbers_and_entities(retrieved_context)
-    
-    hallucinated = extracted_from_answer - extracted_from_context
-    if hallucinated:
-        return f"⚠️ Hallucination Alert! Unverified Data: {', '.join(hallucinated)}"
-    return generated_answer
-
-
-# 7. Streamlit UI
-
-
-import streamlit as st
-
-st.title("💰 Financial RAG: BMW Finance N.V. Q&A")
+st.title("📊 Financial Statement Q&A")
+st.subheader("Ask financial questions based on the latest company reports")
 
 query = st.text_input("Enter your financial question:")
+
 if query:
-    retrieved_context = "\n".join(hybrid_retrieve_top_chunks(query))
-    generated_answer = generate_answer(query)
-    verified_answer = detect_hallucinations(query, generated_answer, retrieved_context)
+    retrieved_chunks, retrieval_confidence = multistage_retrieve(query)
+    retrieved_text = "\n".join(retrieved_chunks)
+    financial_values, table_confidence = extract_financial_value(tables, query)
 
-    st.markdown(f"### **Answer:** {verified_answer}")
-    st.markdown(f"**Confidence Score:** {len(retrieved_context.split()) / 500:.2f} (Higher is better)")
+    final_confidence = round((retrieval_confidence + table_confidence) / 2, 2)
 
-    with st.expander("📄 Supporting Sources"):
-        st.write(retrieved_context)
+    st.write("### ✅ Retrieved Context")
+    st.success(retrieved_text)
 
-# 8. Testing & Validation
+    if financial_values and financial_values[0] != "No valid financial data found":
+        st.write("### 📊 Extracted Financial Data")
+        st.info(f"**2023:** {financial_values[0]}, **2022:** {financial_values[1]}")
+    else:
+        st.warning("No valid financial data found for this query.")
 
-# Define test queries
+    st.write(f"### 🔍 Confidence Score: {final_confidence}%")
+
+# ✅ Testing & Validation
+st.sidebar.header("🔍 Testing & Validation")
+
 test_queries = [
-    ("What was BMW Finance N.V.'s net income for 2023?", "High confidence"),
-    ("What is the expected financial outlook for 2024?", "Low confidence"),
+    ("Total Receivables from BMW Group companies", "High Confidence"),
+    ("Revenue Growth over 5 years", "Low Confidence"),
     ("What is the capital of France?", "Irrelevant")
 ]
 
-# Run tests
-for query, expected_confidence in test_queries:
-    print(f"\n🔹 **Query:** {query} \n(Expected Confidence: {expected_confidence})")
-    retrieved_context = "\n".join(hybrid_retrieve_top_chunks(query))
-    generated_answer = generate_answer(query)
-    verified_answer = detect_hallucinations(query, generated_answer, retrieved_context)
-    print(f"✅ **Answer:** {verified_answer}")
-    print(f"📊 **Confidence Score:** {len(retrieved_context.split()) / 500:.2f}\n")
+for test_query, confidence_level in test_queries:
+    st.sidebar.subheader(f"📝 Test: {test_query} ({confidence_level})")
+    
+    retrieved_chunks, retrieval_confidence = multistage_retrieve(test_query)
+    retrieved_text = "\n".join(retrieved_chunks)
+    financial_values, table_confidence = extract_financial_value(tables, test_query)
+
+    final_confidence = round((retrieval_confidence + table_confidence) / 2, 2)
+
+    st.sidebar.write(f"**🔹 Retrieved Context:** {retrieved_text[:500]}...")
+    st.sidebar.write(f"**🔍 Confidence Score:** {final_confidence}%")
+
+    if financial_values and financial_values[0] != "No valid financial data found":
+        st.sidebar.write(f"📊 **Extracted Financial Data:** 2023: {financial_values[0]}, 2022: {financial_values[1]}")
+    else:
+        st.sidebar.warning("⚠️ No valid financial data found.")
+
+st.sidebar.write("✅ Testing Complete")
